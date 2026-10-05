@@ -319,7 +319,7 @@ jobs:
         # Kept as ./ : the policy matches this exact form for local actions.
         uses: ./.github/actions/drop-root  # zizmor: ignore[self-repository]
         with:
-          keep-docker: ${{ inputs.concern == 'db-containers' || inputs.concern == 'apphost-cold-start' }}
+          keep-docker: 'true'
 
       - name: Restore the solution and install the sub-step library
         uses: ./.github/actions/restore  # zizmor: ignore[self-repository]

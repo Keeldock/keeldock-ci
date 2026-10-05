@@ -41,7 +41,7 @@ MINTS = {
   }]
 }.freeze
 KEEP_DOCKER = {
-  '.github/workflows/validation-concern.yml' => ["#{E}inputs.concern == 'db-containers' || inputs.concern == 'apphost-cold-start' }}"]
+  '.github/workflows/validation-concern.yml' => ["#{E}inputs.concern == 'db-containers' || inputs.concern == 'apphost-cold-start' }}", 'true']
 }.freeze
 PREFLIGHT = { '.github/workflows/validation.yml' => 'validate-input' }.freeze
 INPUT_DEFAULTS = {

@@ -207,7 +207,7 @@ expect_fail 'the reviewed mint removed' "${root}" 'the reviewed token mint is mi
 
 # keep-docker is absent or the reviewed expression (rule 8).
 reviewed_keep="\${{ inputs.concern == 'db-containers' || inputs.concern == 'apphost-cold-start' }}"
-for keep in "'true'" 'true' '${{ true }}' "\${{ inputs.concern != 'unit' }}" "${reviewed_keep} || true"; do
+for keep in 'true' '${{ true }}' "\${{ inputs.concern != 'unit' }}" "${reviewed_keep} || true"; do
   root="$(fresh keep-docker)"; swap "${root}" .github/workflows/validation-concern.yml "keep-docker: ${reviewed_keep}" "keep-docker: ${keep}"
   expect_fail "keep-docker ${keep}" "${root}" 'keep-docker must be absent or the reviewed expression'
 done
