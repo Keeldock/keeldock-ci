@@ -1,0 +1,157 @@
+name: Keel Dock source validation (protected)
+
+# Validates one exact commit of the private Moh-Bakr/keeldock-cloud repository on hosted runners.
+# This repository is public, so its minutes are free; the source-read pattern checks out the exact
+# private SHA and destroys the token before project code runs (docs/how-ci-works.md).
+#
+# Every run executes build-format, structural, unit and contracts-publish-smoke on Linux, macOS and
+# Windows, plus two Linux-only concerns: db-containers (the Testcontainers suites) and supply-chain
+# (vulnerable packages, SBOM and licence gate). The Aspire AppHost cold start (`apphost-cold-start`)
+# is opt-in: dispatch with `apphost: true`.
+#
+# **The vulnerable-package gate is blocking by default** (`vulnerability_gate: high`: High and
+# Critical advisories fail supply-chain). It fails closed: if the scan cannot complete (feed
+# unreachable, a non-zero exit, unparseable output) the step fails rather than warns. `critical`
+# fails on Critical only; `none` is report-only. A reviewed exception for an advisory with no fix
+# lives in the private repository at `.github/nuget-vulnerability-exceptions.txt`, one
+# `<GHSA-or-CVE-id>  <review-by YYYY-MM-DD>  # reason` per line, honoured through its review-by date.
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character commit SHA to validate from private keeldock-cloud
+        required: true
+        type: string
+      vulnerability_gate:
+        description: Vulnerable-package scan severity that fails the supply-chain concern (high = High and Critical, fail-closed; none = warn-only)
+        required: false
+        default: high
+        type: choice
+        options: [none, high, critical]
+      apphost:
+        description: Also run the Aspire AppHost cold-start concern (experimental, Linux; off by default)
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: keeldock-validation-${{ github.workflow }}-${{ inputs.source_sha }}
+  # Never cancel a source-bearing run: cancellation can interrupt the cleanup
+  # step that revokes the short-lived private-source token.
+  cancel-in-progress: false
+
+jobs:
+  # Runs with no environment and no secret. It refuses the dispatch before any job enters
+  # source-read when the environment is missing or is not limited to protected branches: a job
+  # that names a missing environment would otherwise create it, unprotected, on first use.
+  validate-input:
+    permissions:
+      actions: read
+    if: github.repository == 'Keeldock/keeldock-ci' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted')
+    name: Validate protected dispatch input
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate exact source SHA and the source-read environment
+        shell: bash
+        env:
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUESTED_VULN_GATE: ${{ inputs.vulnerability_gate }}
+          CONTROL_PLANE_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "- Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}" >> "${GITHUB_STEP_SUMMARY}"
+          if [[ ! "${REQUESTED_SOURCE_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo 'source_sha must be a full 40-character hexadecimal commit SHA' >&2
+            exit 1
+          fi
+          case "${REQUESTED_VULN_GATE}" in none|high|critical) ;; *) echo 'vulnerability_gate must be none, high or critical' >&2; exit 1 ;; esac
+          code="$(curl --silent --show-error --retry 5 --retry-delay 2 --retry-max-time 60 --output "${RUNNER_TEMP}/environment.json" --write-out '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer ${CONTROL_PLANE_TOKEN}" -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/environments/source-read")" || code=000
+          if [[ "${code}" == 404 ]]; then
+            echo 'The source-read environment does not exist yet. Create it (deployment branches: protected branches only) with the SOURCE_READER_PRIVATE_KEY secret and the SOURCE_READER_APP_ID variable; see docs/how-ci-works.md, "One-time settings". Refusing before any job enters it.' >&2
+            exit 1
+          fi
+          if [[ "${code}" != 200 ]]; then
+            echo "The source-read environment could not be read (HTTP ${code}); refusing to continue" >&2
+            exit 1
+          fi
+          if [[ "$(jq -r '[.deployment_branch_policy.protected_branches, .deployment_branch_policy.custom_branch_policies] | @tsv' "${RUNNER_TEMP}/environment.json")" != $'true\tfalse' ]]; then
+            echo 'The source-read environment must allow protected branches only (Settings, Environments, source-read, Deployment branches); refusing to continue' >&2
+            exit 1
+          fi
+          echo 'source-read environment: present, protected branches only'
+
+  validate:
+    permissions:
+      contents: read
+    if: github.repository == 'Keeldock/keeldock-ci' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted')
+    needs: validate-input
+    strategy:
+      # Each concern on each operating system is independent evidence: a Windows path bug must
+      # not hide the Linux result, and a failing concern names its gate without opening a log.
+      fail-fast: false
+      matrix:
+        include:
+          - { concern: build-format, platform: linux }
+          - { concern: build-format, platform: macos }
+          - { concern: build-format, platform: windows }
+          - { concern: structural, platform: linux }
+          - { concern: structural, platform: macos }
+          - { concern: structural, platform: windows }
+          - { concern: unit, platform: linux }
+          - { concern: unit, platform: macos }
+          - { concern: unit, platform: windows }
+          - { concern: contracts-publish-smoke, platform: linux }
+          - { concern: contracts-publish-smoke, platform: macos }
+          - { concern: contracts-publish-smoke, platform: windows }
+          # Only the Ubuntu runner has a Docker daemon, so the Testcontainers suites are Linux-only.
+          - { concern: db-containers, platform: linux }
+          - { concern: supply-chain, platform: linux }
+          - { concern: apphost-cold-start, platform: linux }
+    uses: ./.github/workflows/validation-concern.yml  # zizmor: ignore[self-repository]
+    # Exactly one secret is passed, by name: the App private key. It is an environment secret of
+    # source-read; GitHub gives the called job, which enters that environment, the environment's
+    # value. The App id (SOURCE_READER_APP_ID) is a variable of the same environment, read by the
+    # called job directly. Nothing else is passed or inherited.
+    secrets:
+      SOURCE_READER_PRIVATE_KEY: ${{ secrets.SOURCE_READER_PRIVATE_KEY }}
+    with:
+      environment: source-read
+      source_sha: ${{ inputs.source_sha }}
+      platform: ${{ matrix.platform }}
+      concern: ${{ matrix.concern }}
+      apphost: ${{ inputs.apphost }}
+      vulnerability_gate: ${{ inputs.vulnerability_gate }}
+
+  # Tabulates every concern's duration and conclusion and warns when one took more than 25% (and
+  # more than two minutes) longer than the baseline, in seconds, keyed `<os> <concern>` (measured on
+  # Taurine-CI run 37232233167). Warning only, never fails the run, publishes no artifact.
+  timings:
+    if: ${{ always() && github.repository == 'Keeldock/keeldock-ci' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') }}
+    needs: [validate]
+    name: Concern timings
+    runs-on: ubuntu-24.04
+    # Reporting only: a queued, slow or cancelled timings job must never fail a passing run.
+    continue-on-error: true
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out public control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Tabulate concern timings against the baseline
+        uses: ./.github/actions/timings  # zizmor: ignore[self-repository]
+        with:
+          mode: table
+          label: Keel Dock
+          github-token: ${{ github.token }}
+          baseline-seconds: '{"linux build-format":408,"linux structural":257,"linux unit":172,"linux contracts-publish-smoke":182,"linux db-containers":854,"macos build-format":432,"macos structural":315,"macos unit":246,"macos contracts-publish-smoke":135,"windows build-format":425,"windows structural":272,"windows unit":274,"windows contracts-publish-smoke":253}'
+          name-pattern: '^validate \(.+\) / Keel Dock (?<concern>(linux|macos|windows) .+)$'

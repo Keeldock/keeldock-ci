@@ -1,0 +1,83 @@
+name: Validate public CI policy
+
+# The policy gate for this public repository. It has no environment, secret, variable, OIDC
+# permission, private checkout, cache access or artifact upload, and validates only this
+# repository. Each check is a script under .github/policy/ (one responsibility each; read the
+# script header for the rule and its rationale); this file only sequences them. Its job name,
+# "Validate workflow policy", is the required status check on main.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: public-policy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    permissions:
+      contents: read
+    name: Validate workflow policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out public policy repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Repository contents: no private source, credential material or unexpected path.
+      - name: Reject private-source and credential material
+        shell: bash
+        run: bash .github/policy/check-repository.sh
+
+      # Pinned actionlint and zizmor release binaries, verified against committed SHA-256s.
+      # zizmor's online audits use this run's read-only token.
+      - name: Lint workflows with pinned actionlint and zizmor
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/policy/lint.sh
+
+      # Rules for every workflow and composite: SHA pins, permissions: {}, no
+      # pull_request_target, no secrets: inherit, only the reviewed job enters an environment.
+      - name: Check the universal workflow rules
+        shell: bash
+        run: ruby .github/policy/check-universal.rb
+
+      # Trust tiers: reviewed Actions, token revocation and root removal order, cache, secrets,
+      # the dispatcher and the concern's pinned source identity.
+      - name: Enforce immutable reviewed Actions and safe workflow features
+        shell: bash
+        run: bash .github/policy/check-workflows.sh
+
+      # More than 800 lines fails, more than 400 warns.
+      - name: Check workflow and composite file sizes
+        shell: bash
+        run: bash .github/policy/check-sizes.sh
+
+      # Fixture tests: the universal rules, size limits, cache, drop-root, untrusted freshness and
+      # settings guards accept and reject what they should.
+      - name: Test the policy rules against fixtures
+        shell: bash
+        run: bash .github/policy/test-policy.sh
+
+      # The vulnerable-package gate: clean, listed, expired, malformed and incomplete-scan fixtures.
+      - name: Test the vulnerability gate against fixtures
+        shell: bash
+        run: bash .github/policy/test-vuln-gate.sh
+
+      # Release-installed tools are listed with their pins; Dependabot covers the Actions.
+      - name: Check the tool pin list and Dependabot coverage
+        shell: bash
+        run: bash .github/policy/check-tools.sh
+
+      # Every egress allow-list entry has a known scope, a host pattern and a reason.
+      - name: Check the egress allow-list
+        shell: bash
+        run: bash .github/policy/check-egress-allowlist.sh

@@ -1,0 +1,67 @@
+name: Concern timings
+description: >
+  Table mode only (each concern reports its own duration inline): run in a separate job with
+  actions: read, it tabulates every matching job of the run against a committed baseline and
+  warns, never fails, when one is more than 25% and two minutes slower.
+
+inputs:
+  mode:
+    description: table (the only mode)
+    required: true
+  label:
+    description: Platform label for the table heading and warnings (table mode)
+    required: false
+    default: ''
+  baseline-seconds:
+    description: JSON object of concern name to baseline seconds (table mode)
+    required: false
+    default: '{}'
+  name-pattern:
+    description: Regular expression with a named group concern matching job names (table mode)
+    required: false
+    default: ''
+  github-token:
+    description: Token with actions read, for listing the run's jobs (table mode)
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Tabulate timings against the baseline
+      if: ${{ inputs.mode == 'table' }}
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        LABEL: ${{ inputs.label }}
+        BASELINE_SECONDS: ${{ inputs.baseline-seconds }}
+        NAME_PATTERN: ${{ inputs.name-pattern }}
+      run: |
+        set -euo pipefail
+        rows="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" \
+          | jq -r --arg re "${NAME_PATTERN}" '.jobs[]
+            | select(.started_at != null and .completed_at != null)
+            | select(.name | test($re))
+            | [(.name | capture($re).concern), (.conclusion // "unknown"),
+               (((.completed_at | fromdateiso8601) - (.started_at | fromdateiso8601)) | floor)]
+            | @tsv' | sort)"
+        {
+          echo "## ${LABEL} timings"
+          echo
+          echo '| Concern | Duration | Baseline | Conclusion |'
+          echo '| --- | --- | --- | --- |'
+        } >> "${GITHUB_STEP_SUMMARY}"
+        while IFS=$'\t' read -r concern conclusion seconds; do
+          [[ -n "${concern}" ]] || continue
+          base="$(jq -r --arg c "${concern}" '.[$c] // empty' <<<"${BASELINE_SECONDS}")"
+          shown='none'
+          if [[ -n "${base}" ]]; then
+            shown="$((base / 60))m$(printf '%02d' $((base % 60)))s"
+            if (( seconds > base * 125 / 100 && seconds > base + 120 )); then
+              echo "::warning title=Slow job::${LABEL} ${concern} took $((seconds / 60))m$((seconds % 60))s against a baseline of ${shown} (more than 25% slower)"
+              shown="${shown} (SLOWER)"
+            fi
+          fi
+          printf '| %s | %dm%02ds | %s | %s |\n' "${concern}" $((seconds / 60)) $((seconds % 60)) "${shown}" "${conclusion}" >> "${GITHUB_STEP_SUMMARY}"
+        done <<<"${rows}"
