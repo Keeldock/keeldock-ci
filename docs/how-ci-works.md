@@ -59,7 +59,8 @@ repository, and the only job that enters an environment (`source-read`, which ho
 1. **Guard.** The repository must be this one, the ref must be `refs/heads/main` or
    `refs/heads/untrusted`, the SHA must match `^[0-9a-fA-F]{40}$`, and the App id and key must
    be present (the key's value never enters this step, only whether it is empty). A run from
-   `untrusted` must be running main's tip or an ancestor of it (see Ref isolation).
+   `untrusted` must be running main's tip, or an ancestor of it with no `.github/` change on
+   main since (see Ref isolation).
 2. **Mint.** `actions/create-github-app-token` issues a short-lived token for
    `Moh-Bakr/keeldock-cloud` only, with `contents: read` only. Its own end-of-job revoke is
    disabled (`skip-token-revoke`) because step 4 revokes explicitly.
@@ -134,7 +135,7 @@ runtime token. So:
 | Ref | Runs | Caches |
 | --- | --- | --- |
 | `main` | Only SHAs reachable from keeldock-cloud `main`; anything else is refused after the revoke, before project code, with the command to use `untrusted` | The only ref that restores or saves the NuGet cache |
-| `untrusted` | Any SHA (a feature branch tip). Its own commit must equal main's tip or be an ancestor of it; ahead or diverged stops before any token is minted | Never restores or saves a cache |
+| `untrusted` | Any SHA (a feature branch tip). Its own commit must equal main's tip, or be an ancestor of it with no `.github/` change on main since; anything else stops before any token is minted | Never restores or saves a cache |
 
 Every NuGet cache restore and save carries the top-level terms `github.ref ==
 'refs/heads/main'` and `steps.verified-source.outputs.protected-ancestor == 'true'`;
@@ -155,7 +156,12 @@ gh workflow run validation.yml --repo Keeldock/keeldock-ci --ref untrusted -f so
 ```
 
 Keep `untrusted` in sync by hand after each merge to main (an admin fast-forward; the ruleset
-blocks everything else). A run from a behind `untrusted` still passes and prints a warning:
+blocks everything else). A run from a behind `untrusted` passes with a warning only while main
+has not changed `.github/` (a workflow, composite or the policy) since that commit; once it has,
+the run is refused with the sync command, because it would otherwise run workflows main has
+already superseded, perhaps for a security fix. A compare list that cannot be read, or that hits
+the API's 300-file cap, is refused too. This change itself landed in two steps (the base policy's
+freshness fixtures would have rejected it), as "Changing the policy" describes:
 
 ```bash
 git fetch origin && git push origin origin/main:refs/heads/untrusted

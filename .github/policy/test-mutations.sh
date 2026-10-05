@@ -132,6 +132,7 @@ mutation '9. a missing environment accepted' "${dispatcher}" "Refusing before an
             exit 0"
 mutation '9. protected branches only accepted' "${dispatcher}" "!= \$'false\\ttrue' ]]; then" "== never ]]; then"
 mutation '9. any branch-policy list accepted' "${dispatcher}" "!= 'branch:main,branch:untrusted' ]]; then" "== never ]]; then"
+mutation 'untrusted behind main with a later .github/ change accepted' "${concern}" '                if [[ "${github_changes}" != 0 ]]; then' '                if [[ "${github_changes}" == never ]]; then'
 mutation 'vulnerability exception review-by cap lifted' .github/actions/supply-chain/action.yml 'VG_MAX_REVIEW_DAYS=90' 'VG_MAX_REVIEW_DAYS=3650000'
 mutation 'vulnerability exception calendar check loosened' .github/actions/supply-chain/action.yml '(( y >= 1970 && d >= 1 && d <= last )) || return 1' '(( y >= 1970 && d >= 1 && d <= 31 )) || return 1'
 
