@@ -1,0 +1,396 @@
+name: Keel Dock validation concern (protected)
+
+# One concern on one operating system per call, on a clean ephemeral runner doing its own exact
+# private checkout. No source-bearing artifact crosses a job boundary, so every concern restores and
+# rebuilds what it needs. Suites are assigned by the rule scripts/run-tests.sh uses (a Testcontainers
+# reference means a container runtime), so a new suite lands in a concern the day it is written.
+#
+#   build-format            Release build (warnings are errors), format check, structural-suite presence.
+#   structural | unit       the architecture / compatibility / GraphQL composition suites | every other
+#                           suite that needs no container runtime; each then checks the contracts diff.
+#   db-containers           (Linux) every suite that references Testcontainers.
+#   contracts-publish-smoke TypeScript contract check, publish of Api / Worker / Migrator, Migrator smoke
+#                           and, on Linux, the Migrator against a digest-pinned PostgreSQL.
+#   supply-chain            (Linux) vulnerable-package scan (blocking at the vulnerability_gate input,
+#                           high by default, fail-closed) and the CycloneDX SBOM with its denied-licence
+#                           gate (SBOM_DENIED_LICENSES in the restore composite).
+#   apphost-cold-start      (Linux, opt-in) bounded Aspire AppHost cold start.
+#
+# This file owns everything that must run before project code (the protected call input, the token
+# mint, the exact private checkout into src/, the identity check and the token revoke) and the
+# job-level wiring. Everything after the revoke lives in the composites, one per concern plus the
+# restore, summary and proof steps; the private source is checked out into src/ so this
+# repository's local composites stay available after the checkout.
+
+on:
+  workflow_call:
+    secrets:
+      SOURCE_READER_PRIVATE_KEY:
+        description: Private key of the source-reader GitHub App for keeldock-cloud
+        required: true
+    inputs:
+      source_sha:
+        description: Exact 40-character commit SHA to validate from private keeldock-cloud
+        required: true
+        type: string
+      platform:
+        description: linux, macos or windows
+        required: true
+        type: string
+      environment:
+        description: GitHub environment holding the source-reader App credential (source-read)
+        required: true
+        type: string
+      concern:
+        description: build-format, structural, unit, db-containers, apphost-cold-start or contracts-publish-smoke
+        required: true
+        type: string
+      vulnerability_gate:
+        description: none (warn-only), high (fail on High and Critical advisories; the default) or critical (fail on Critical only); high and critical fail closed when the scan cannot complete
+        required: false
+        default: high
+        type: string
+      apphost:
+        description: Whether the experimental apphost-cold-start concern may run (it is skipped otherwise)
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+env:
+  # The numeric id is what the identity check verifies, so a renamed or swapped repository fails.
+  SOURCE_REPOSITORY_ID: '1377321992'
+  SOURCE_REPOSITORY_OWNER: Moh-Bakr
+  SOURCE_REPOSITORY_NAME: keeldock-cloud
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  TESTINGPLATFORM_TELEMETRY_OPTOUT: 'true'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 'true'
+  CI: 'true'
+  # Testcontainers' resource reaper, pinned by digest (the reference the source's own ci.yml pins). It
+  # stays enabled: it removes containers when a test host is killed or times out.
+  TESTCONTAINERS_RYUK_CONTAINER_IMAGE: testcontainers/ryuk:0.14.0@sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0
+
+jobs:
+  validate:
+    permissions:
+      contents: read
+    # The AppHost cold start is opt-in; a skipped job is "not requested", never a pass.
+    if: ${{ inputs.concern != 'apphost-cold-start' || inputs.apphost }}
+    name: Keel Dock ${{ inputs.platform }} ${{ inputs.concern }}
+    environment: ${{ inputs.environment }}
+    runs-on: ${{ inputs.platform == 'linux' && 'ubuntu-24.04' || (inputs.platform == 'macos' && 'macos-15' || 'windows-2022') }}
+    timeout-minutes: ${{ (inputs.concern == 'db-containers' || inputs.concern == 'apphost-cold-start') && 45 || 30 }}
+    steps:
+      - name: Start the concern timer
+        shell: bash
+        run: echo "CONCERN_STARTED_AT=$(date +%s)" >> "${GITHUB_ENV}"
+
+      - name: Check out public control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate protected call input
+        shell: bash
+        env:
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUESTED_PLATFORM: ${{ inputs.platform }}
+          REQUESTED_CONCERN: ${{ inputs.concern }}
+          REQUESTED_VULN_GATE: ${{ inputs.vulnerability_gate }}
+          # This repository's own read-only job token, used only to compare against main below.
+          CONTROL_PLANE_TOKEN: ${{ github.token }}
+          # The App settings of the source-read environment. Only presence and shape are checked
+          # here, so a run before the owner's one-time setup stops with a clear message instead of
+          # a failed mint; the key itself never enters this step.
+          SOURCE_READER_APP_ID: ${{ vars.SOURCE_READER_APP_ID }}
+          SOURCE_READER_KEY_PRESENT: ${{ secrets.SOURCE_READER_PRIVATE_KEY != '' }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "Keeldock/keeldock-ci" || ( "${GITHUB_REF}" != "refs/heads/main" && "${GITHUB_REF}" != "refs/heads/untrusted" ) ]]; then
+            echo 'validation must run only from the protected main or untrusted branch of Keeldock/keeldock-ci' >&2
+            exit 1
+          fi
+          if [[ ! "${SOURCE_READER_APP_ID}" =~ ^([0-9]{1,12}|Iv[0-9A-Za-z.]{8,40})$ || "${SOURCE_READER_KEY_PRESENT}" != true ]]; then
+            echo 'The source-reader App is not configured: the source-read environment needs the variable SOURCE_READER_APP_ID (the App ID) and the secret SOURCE_READER_PRIVATE_KEY (the PEM). See docs/how-ci-works.md, "One-time settings". Refusing before any token is minted.' >&2
+            exit 1
+          fi
+          if [[ ! "${REQUESTED_SOURCE_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo 'source_sha must be a full 40-character hexadecimal commit SHA' >&2
+            exit 1
+          fi
+          case "${REQUESTED_PLATFORM}" in linux|macos|windows) ;; *) echo "Unsupported platform: ${REQUESTED_PLATFORM}" >&2; exit 1 ;; esac
+          case "${REQUESTED_CONCERN}" in
+            build-format|structural|unit|contracts-publish-smoke) ;;
+            db-containers|apphost-cold-start|supply-chain)
+              if [[ "${REQUESTED_PLATFORM}" != linux ]]; then
+                echo "${REQUESTED_CONCERN} runs on Linux only" >&2
+                exit 1
+              fi
+              ;;
+            *) echo "Unsupported concern: ${REQUESTED_CONCERN}" >&2; exit 1 ;;
+          esac
+          case "${REQUESTED_VULN_GATE}" in none|high|critical) ;; *) echo 'vulnerability_gate must be none, high or critical' >&2; exit 1 ;; esac
+          # Ref isolation: unprotected SHAs run from the untrusted ref, whose cache writes main never
+          # reads, so the workflows that run there must be ones main already reviewed. untrusted is
+          # admin-only and fast-forward-only (its ruleset) and is only ever synced from main, so any
+          # commit it points at was once main's tip: identical and behind are accepted, ahead and
+          # diverged refused, all before any token is minted.
+          if [[ "${GITHUB_REF}" == refs/heads/untrusted ]]; then
+            compare="$(curl --fail --silent --show-error --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors \
+              -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer ${CONTROL_PLANE_TOKEN}" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_SHA}" \
+              | jq -er '[.status, (.behind_by // 0)] | @tsv')" \
+              || { echo 'untrusted ref: could not compare this run with main; refusing to continue' >&2; exit 1; }
+            IFS=$'\t' read -r freshness behind_by <<<"${compare}"
+            case "${freshness}" in
+              identical) ;;
+              behind)
+                echo "::warning::untrusted is ${behind_by} commit(s) behind main; this run uses an older, previously reviewed main commit. Sync it with: git push origin origin/main:refs/heads/untrusted"
+                if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+                  printf '%s\n' "**Warning:** \`untrusted\` is ${behind_by} commit(s) behind \`main\`. This run used an older, previously reviewed \`main\` commit (\`${GITHUB_SHA}\`). Sync it with \`git push origin origin/main:refs/heads/untrusted\`." >> "${GITHUB_STEP_SUMMARY}"
+                fi
+                ;;
+              *)
+                echo "untrusted ref: this run's workflows (${GITHUB_SHA}) are '${freshness}' relative to main, not identical to it or an ancestor of it; refusing to continue." >&2
+                echo 'Reset untrusted by an admin fast-forward from main (docs/how-ci-works.md, "Ref isolation"), then dispatch again.' >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+      - name: Mint read-only private-source token
+        id: source-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.SOURCE_READER_APP_ID }}
+          private-key: ${{ secrets.SOURCE_READER_PRIVATE_KEY }}
+          owner: ${{ env.SOURCE_REPOSITORY_OWNER }}
+          repositories: ${{ env.SOURCE_REPOSITORY_NAME }}
+          permission-contents: read
+          skip-token-revoke: true  # zizmor: ignore[github-app]
+
+      - name: Check out exact private source SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY_OWNER }}/${{ env.SOURCE_REPOSITORY_NAME }}
+          ref: ${{ inputs.source_sha }}
+          token: ${{ steps.source-token.outputs.token }}
+          path: src
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Verify identity, exact checkout, and revoke source token
+        id: verified-source
+        if: always()
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          set +x
+          failed=0
+          requested_sha="$(printf '%s' "${REQUESTED_SOURCE_SHA}" | tr '[:upper:]' '[:lower:]')"
+          if [[ -z "${SOURCE_TOKEN}" ]]; then
+            echo 'No source token was minted; refusing to continue' >&2
+            exit 1
+          fi
+          if ! identity="$(curl --fail --silent --show-error --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer ${SOURCE_TOKEN}" -H 'X-GitHub-Api-Version: 2022-11-28' "${GITHUB_API_URL}/repositories/${SOURCE_REPOSITORY_ID}")"; then
+            echo 'The configured source repository identity could not be resolved' >&2
+            failed=1
+          elif [[ "$(jq -r '.id' <<<"${identity}")" != "${SOURCE_REPOSITORY_ID}" || "$(jq -r '.owner.login' <<<"${identity}")" != "${SOURCE_REPOSITORY_OWNER}" || "$(jq -r '.name' <<<"${identity}")" != "${SOURCE_REPOSITORY_NAME}" ]]; then
+            echo 'The configured source repository identity did not match' >&2
+            failed=1
+          fi
+          if ! checked_out_sha="$(git -C src rev-parse --verify HEAD 2>/dev/null | tr '[:upper:]' '[:lower:]')"; then
+            echo 'The private source checkout did not complete' >&2
+            failed=1
+          elif [[ "${checked_out_sha}" != "${requested_sha}" ]]; then
+            echo 'The checked-out commit does not match source_sha' >&2
+            failed=1
+          fi
+          if ! api_sha="$(curl --fail --silent --show-error --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer ${SOURCE_TOKEN}" -H 'X-GitHub-Api-Version: 2022-11-28' "${GITHUB_API_URL}/repos/${SOURCE_REPOSITORY_OWNER}/${SOURCE_REPOSITORY_NAME}/commits/${requested_sha}" | jq -er '.sha | ascii_downcase')" || [[ "${api_sha}" != "${requested_sha}" ]]; then
+            echo 'The requested source SHA was not resolved from the configured repository' >&2
+            failed=1
+          fi
+          # Protected ancestry: keeldock-cloud has one protected branch, main, so a SHA is protected
+          # exactly when it is reachable from main (the compare of main...<sha> is `identical` or
+          # `behind`). Asked with the contents-read token before it is revoked, so it is fixed before
+          # any project code runs. An API error or anything else answers false (fail closed). Only a
+          # protected SHA may run from main or save the NuGet cache.
+          protected_ancestor=false
+          if (( failed == 0 )); then
+            for branch in main; do
+              status="$(curl --fail --silent --retry 3 --retry-delay 2 --retry-max-time 30 -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer ${SOURCE_TOKEN}" -H 'X-GitHub-Api-Version: 2022-11-28' "${GITHUB_API_URL}/repos/${SOURCE_REPOSITORY_OWNER}/${SOURCE_REPOSITORY_NAME}/compare/${branch}...${requested_sha}?per_page=1" 2>/dev/null | jq -r '.status // empty' 2>/dev/null || true)"
+              if [[ "${status}" == identical || "${status}" == behind ]]; then
+                protected_ancestor=true
+                echo "protected ancestry: the source SHA is on ${branch}"
+                break
+              fi
+            done
+            [[ "${protected_ancestor}" == true ]] || echo 'protected ancestry: the source SHA is not reachable from main'
+          fi
+          # Ref isolation, fail-closed: main runs only protected-ancestry SHAs.
+          if [[ "${GITHUB_REF}" == refs/heads/main && "${failed}" -eq 0 && "${protected_ancestor}" != true ]]; then
+            echo 'This source SHA is not reachable from main of the source repository, so main refuses it.' >&2
+            echo 'Dispatch it from the untrusted ref: gh workflow run validation.yml --repo Keeldock/keeldock-ci --ref untrusted -f source_sha=<sha>' >&2
+            failed=1
+          fi
+          if ! curl --fail --silent --show-error --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors -X DELETE -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer ${SOURCE_TOKEN}" -H 'X-GitHub-Api-Version: 2022-11-28' "${GITHUB_API_URL}/installation/token"; then
+            echo 'Source token revocation failed; refusing to execute project code' >&2
+            failed=1
+          fi
+          unset SOURCE_TOKEN
+          git config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          git config --global --unset-all http.https://github.com/.extraheader 2>/dev/null || true
+          git config --global --unset-all credential.helper 2>/dev/null || true
+          find "${RUNNER_TEMP}" -type f -path '*/_runner_file_commands/set_output_*' -exec sh -c ': > "$1"' _ {} \;
+          # Written after the clear above, and only ever the literal true or false.
+          if [[ "${protected_ancestor}" == true ]]; then
+            echo 'protected-ancestor=true' >> "${GITHUB_OUTPUT}"
+          else
+            echo 'protected-ancestor=false' >> "${GITHUB_OUTPUT}"
+          fi
+          (( failed == 0 ))
+
+      - name: Start the egress audit
+        # Audit only: records outbound destinations, never blocks, never fails the job.
+        continue-on-error: true
+        # Kept as ./ : the policy matches this exact form for local actions.
+        uses: ./.github/actions/egress-audit  # zizmor: ignore[self-repository]
+        with:
+          phase: start
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          # The SDK band comes from the source's own global.json.
+          global-json-file: src/global.json
+
+      - name: Set up Node
+        if: inputs.concern == 'contracts-publish-smoke'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      # NuGet's downloaded third-party packages only (`~/.nuget/packages`): never bin/, obj/, publish
+      # output or anything under the private source. The key hashes the lock files and is computed
+      # here, before project code; the save reuses it (cache-primary-key). Main only, for a protected
+      # source SHA (ref isolation): restore and save carry both top-level terms, and the cache policy
+      # enforces it.
+      - name: Restore cached NuGet packages
+        id: nuget-packages
+        if: ${{ github.ref == 'refs/heads/main' && steps.verified-source.outputs.protected-ancestor == 'true' && steps.verified-source.outcome == 'success' }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/packages.lock.json', 'src/Directory.Packages.props') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      # Every restored .nupkg is re-hashed against the lock file's contentHash and only matching
+      # archives are kept, as a local feed; everything else restored is deleted (see the composite).
+      - name: Verify restored NuGet packages against the lock files
+        id: nuget-verify
+        uses: ./.github/actions/nuget-verify  # zizmor: ignore[self-repository]
+        with:
+          cache-hit: ${{ steps.nuget-packages.outputs.cache-hit }}
+          platform: ${{ inputs.platform }}
+
+      # The Migrator proof's digest-pinned PostgreSQL (Linux), started while Docker is still open.
+      - name: Start the pinned PostgreSQL for the Migrator proof
+        if: inputs.platform == 'linux' && inputs.concern == 'contracts-publish-smoke'
+        uses: ./.github/actions/postgres-start  # zizmor: ignore[self-repository]
+
+      # The sub-steps below record a fixed reason each; full output stays under RUNNER_TEMP and only
+      # totals and failing test names are published. The summary step fails the concern at the end.
+      # Root goes here (finding H2), before the first project command. Docker goes with it, except for
+      # the two concerns whose project code starts containers itself (Testcontainers, the Aspire
+      # AppHost): Docker access is root-equivalent, so for those the summary records it.
+      - name: Remove root before project code
+        # Kept as ./ : the policy matches this exact form for local actions.
+        uses: ./.github/actions/drop-root  # zizmor: ignore[self-repository]
+        with:
+          keep-docker: ${{ inputs.concern == 'db-containers' || inputs.concern == 'apphost-cold-start' }}
+
+      - name: Restore the solution and install the sub-step library
+        uses: ./.github/actions/restore  # zizmor: ignore[self-repository]
+        with:
+          local-feed: ${{ steps.nuget-verify.outputs.feed }}
+
+      - name: Build and check formatting
+        if: inputs.concern == 'build-format'
+        uses: ./.github/actions/build-format  # zizmor: ignore[self-repository]
+
+      - name: Run the assigned test suites
+        if: inputs.concern == 'structural' || inputs.concern == 'unit' || inputs.concern == 'db-containers'
+        uses: ./.github/actions/test-suites  # zizmor: ignore[self-repository]
+        with:
+          concern: ${{ inputs.concern }}
+
+      - name: Scan vulnerable packages and generate the SBOM
+        if: inputs.concern == 'supply-chain'
+        uses: ./.github/actions/supply-chain  # zizmor: ignore[self-repository]
+        with:
+          # Vulnerable-package gate, from the dispatch input: none (warn-only), high or critical.
+          vulnerability-gate: ${{ inputs.vulnerability_gate }}
+
+      - name: Cold start the Aspire AppHost
+        if: inputs.concern == 'apphost-cold-start'
+        uses: ./.github/actions/apphost  # zizmor: ignore[self-repository]
+
+      - name: Check contracts, publish and run the Migrator
+        if: inputs.concern == 'contracts-publish-smoke'
+        uses: ./.github/actions/contracts-publish  # zizmor: ignore[self-repository]
+        with:
+          platform: ${{ inputs.platform }}
+
+      - name: Publish the sub-step summary
+        id: concern-summary
+        uses: ./.github/actions/summary  # zizmor: ignore[self-repository]
+        with:
+          concern: ${{ inputs.concern }}
+          platform: ${{ inputs.platform }}
+
+      # Saved only from main, only for a source SHA reachable from keeldock-cloud main (fixed before
+      # project code ran), only on a miss, only after the verification and the whole concern passed,
+      # and under the key computed before project code.
+      - name: Save verified NuGet packages
+        if: ${{ github.ref == 'refs/heads/main' && steps.verified-source.outputs.protected-ancestor == 'true' && steps.nuget-packages.outputs.cache-hit != 'true' && steps.nuget-verify.outcome == 'success' && steps.concern-summary.outcome == 'success' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.nuget/packages
+          key: ${{ steps.nuget-packages.outputs.cache-primary-key }}
+
+      - name: Publish sanitized validation proof
+        if: always()
+        uses: ./.github/actions/proof  # zizmor: ignore[self-repository]
+        with:
+          concern: ${{ inputs.concern }}
+          platform: ${{ inputs.platform }}
+          source-sha: ${{ inputs.source_sha }}
+
+      # Wall-clock time from the first step, excluding runner queue time.
+      - name: Report concern duration
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          [[ -n "${CONCERN_STARTED_AT:-}" ]] || exit 0
+          e=$(( $(date +%s) - CONCERN_STARTED_AT )); printf '### Concern duration\n\n%dm%02ds from the first step, excluding runner queue time.\n' $((e / 60)) $((e % 60)) >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Report observed egress
+        if: always()
+        continue-on-error: true
+        # Kept as ./ : the policy matches this exact form for local actions.
+        uses: ./.github/actions/egress-audit  # zizmor: ignore[self-repository]
+        with:
+          phase: report

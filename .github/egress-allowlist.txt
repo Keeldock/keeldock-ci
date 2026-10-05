@@ -1,0 +1,106 @@
+# Reviewed outbound endpoints for the Keel Dock source-bearing jobs.
+#
+# Format: one entry per line, "<scope> <pattern>  # reason". The reason is required.
+#   scope    all, or one runner family: linux, macos, windows
+#   pattern  an exact host name; a leading "*." matches one or more labels (subdomains only,
+#            never the suffix itself); any other "*" matches characters within one label.
+#            Wildcards are kept to operator-owned names: a wildcard on a platform where anyone
+#            can create a name (CDNs, cloud storage) would publish a customer's resource name.
+#
+# The egress-audit composite publishes a queried host name only when it matches an entry here.
+# Every other name is published as a count and a truncated SHA-256, so internal, customer or
+# exfiltration-shaped names never reach a public log. An entry is therefore a decision that the
+# name is safe to appear in a public log.
+#
+# Checked by .github/policy/check-egress-allowlist.sh.
+#
+# Evidence: ported on 2026-10-05 from the Moh-Bakr/Taurine-CI allow-list (the `all` and
+# `keeldock` entries that a Keel Dock run reaches; Taurine-only Rust, Android, Playwright and
+# live-proof entries were left out), whose Keel Dock evidence is Taurine-CI run 37303687180
+# against keeldock-cloud main. Re-check against the first runs of this repository.
+
+# --- GitHub and the Actions runner service -------------------------------------------
+all github.com                                  # public and private checkouts, release downloads
+all api.github.com                              # token mint, identity and SHA checks, revoke
+all codeload.github.com                         # archive downloads of pinned releases
+all *.githubusercontent.com                     # release assets, raw files, container bottles
+all *.actions.githubusercontent.com             # runner service: logs, results, cache API
+all githubapp.com                               # runner service apex
+all *.githubapp.com                             # hosted compute orchestrator and watchdog
+all ghcr.io                                     # GitHub container registry (Homebrew bottles)
+all productionresultssa*.blob.core.windows.net  # Actions results storage (logs, summaries)
+all *.github.com                                # GitHub service subdomains (glb-*, uploads, pipelines)
+all blob.*.trafficmanager.net                   # Azure storage stamps behind the results storage (two labels deep: Microsoft's, not a customer profile)
+
+# --- CDN names returned as CNAME targets of the hosts below (exact names only) ------------
+all ubuntu-archive-asm.trafficmanager.net       # azure.archive.ubuntu.com CNAME
+all azurefd-critical-t-prod-stage2.trafficmanager.net  # packages.microsoft.com CNAME
+all pmc-prod-afd-endpoint-evdhh8f8byhsezfp.b01.azurefd.net  # packages.microsoft.com Front Door
+all auth.docker.io.cdn.cloudflare.net           # auth.docker.io CNAME
+all crl.comodoca.com.cdn.cloudflare.net         # crl.comodoca.com CNAME
+all mpki-ocsp.digicert.com.cdn.cloudflare.net   # DigiCert OCSP CNAME
+all www.microsoft.com-c-3.edgekey.net           # www.microsoft.com (PKI) CNAME
+all e13678.dscb.akamaiedge.net                  # www.microsoft.com CNAME target
+all nugetapiprod.trafficmanager.net             # api.nuget.org CNAME
+all api.nuget.org.edgesuite.net                 # api.nuget.org CNAME
+all a2043.dscr.akamai.net                       # api.nuget.org CNAME target
+all nuget-prod-globalcdn.trafficmanager.net     # globalcdn.nuget.org CNAME
+all globalcdn.nuget.org.edgesuite.net           # globalcdn.nuget.org CNAME
+all a918.dscr.akamai.net                        # globalcdn.nuget.org CNAME target
+all dotnetcli.trafficmanager.net                # builds.dotnet.microsoft.com CNAME
+all builds.dotnet.microsoft.com.edgesuite.net   # builds.dotnet.microsoft.com CNAME
+all a441.dscd.akamai.net                        # builds.dotnet.microsoft.com CNAME target
+all mcr.trafficmanager.net                      # mcr.microsoft.com CNAME
+all mcr-0001.mcr-msedge.net                     # mcr.microsoft.com CNAME target
+all homebrew.github.io                          # formulae.brew.sh CNAME (exact: github.io is user-creatable)
+all h3.apis.apple.map.fastly.net                # Apple service edge on Fastly
+all gspe1-ssl.ls.apple.com.edgesuite.net        # Apple service CNAME
+all mesu.apple.com.edgekey.net                  # Apple software-update CNAME
+
+# --- Certificate revocation (OCSP/CRL), queried by TLS stacks on every runner ------------
+all *.digicert.com                              # DigiCert OCSP and CRL
+all *.sectigo.com                               # Sectigo OCSP and CRL
+all *.comodoca.com                              # Comodo (Sectigo) OCSP and CRL
+all *.usertrust.com                             # USERTrust (Sectigo) OCSP and CRL
+all *.globalsign.com                            # GlobalSign OCSP
+all *.lencr.org                                 # Let's Encrypt OCSP and CRL
+all *.pki.goog                                  # Google Trust Services OCSP and CRL
+all oneocsp.microsoft.com                       # Microsoft OCSP
+
+# --- Runner operating-system background traffic (not project code) ------------------------
+macos *.apple.com                               # macOS and Xcode services (OCSP, software update, gdmf)
+macos *.aaplimg.com                             # Apple CDN names
+macos updates.cdn-apple.com                     # Apple software-update CDN
+all *.microsoft.com                             # .NET services; Windows Defender and telemetry
+windows incoming.telemetry.mozilla.org          # Firefox preinstalled on the Windows image
+
+# --- JavaScript (the GraphQL code generator's lock file) ---------------------------------
+all registry.npmjs.org                          # npm ci from the lock files
+all nodejs.org                                  # setup-node fallback download
+all fg.microsoft.map.fastly.net                 # Microsoft edge on Fastly
+all dualstack.k.sni.global.fastly.net           # Fastly edge for npm
+
+# --- Operating-system packages ---------------------------------------------------------
+all azure.archive.ubuntu.com                    # apt on hosted Ubuntu
+all archive.ubuntu.com                          # apt fallback mirror
+all security.ubuntu.com                         # apt security pocket
+all esm.ubuntu.com                              # apt ESM metadata probe on the image
+all motd.ubuntu.com                             # image message-of-the-day refresh
+all ubuntu.com                                  # Ubuntu service apex queried by the image
+all connectivitycheck.gstatic.com               # connectivity probe (runner image)
+all www.google.com                              # connectivity probe (runner image)
+all packages.microsoft.com                      # apt repository preconfigured on the image
+all formulae.brew.sh                            # Homebrew metadata
+
+# --- .NET ------------------------------------------------------------------------------
+all api.nuget.org                               # NuGet restore from the lock files, CycloneDX download
+all globalcdn.nuget.org                         # NuGet package CDN
+all builds.dotnet.microsoft.com                 # setup-dotnet SDK download
+all dotnetcli.azureedge.net                     # setup-dotnet SDK download (legacy feed)
+all aka.ms                                      # setup-dotnet redirects
+
+# --- Container registry (Migrator-proof PostgreSQL, Testcontainers images) ----------------
+linux registry-1.docker.io                      # Docker Hub
+linux auth.docker.io                            # Docker Hub token service
+linux production.cloudflare.docker.com          # Docker Hub layer CDN
+linux docker-images-prod.*.r2.cloudflarestorage.com  # Docker Hub layer storage

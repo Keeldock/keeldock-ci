@@ -1,0 +1,35 @@
+name: Pinned PostgreSQL for the Migrator proof
+description: >
+  Starts the PostgreSQL image and digest the source's own Testcontainers fixtures use (17.6, about
+  160 MB, under the 2 GB cap) for the contracts-publish-smoke Migrator proof on Linux. Started with
+  `docker run` (a job-level `services:` block cannot be per concern), bound to loopback, with a masked
+  random one-run password exported as KD_PG_PASSWORD. It runs before drop-root, which closes Docker;
+  the container keeps running and is discarded with the hosted runner. Runs no project code.
+
+runs:
+  using: composite
+  steps:
+    - name: Start PostgreSQL and wait until it is ready
+      shell: bash
+      # The only value written to GITHUB_ENV is a random hex password from openssl, never input.
+      run: |  # zizmor: ignore[github-env]
+        set -euo pipefail
+        password="$(openssl rand -hex 16)"
+        echo "::add-mask::${password}"
+        echo "KD_PG_PASSWORD=${password}" >> "${GITHUB_ENV}"
+        docker run --detach --name kd-postgres \
+          --publish 127.0.0.1:5432:5432 \
+          --env POSTGRES_PASSWORD="${password}" --env POSTGRES_DB=keeldock \
+          'postgres:17.6@sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929' >/dev/null
+        # Ready over TCP (the image's init-time server listens on its socket only), waited for
+        # here because Docker closes at drop-root; the Migrator later reaches it on the
+        # published loopback port.
+        for _ in $(seq 1 60); do
+          if docker exec kd-postgres pg_isready --host 127.0.0.1 --username postgres --dbname keeldock >/dev/null 2>&1; then
+            echo 'postgres: started and ready (pinned by digest)'
+            exit 0
+          fi
+          sleep 1
+        done
+        echo 'postgres: not ready after 60 s' >&2
+        exit 1
