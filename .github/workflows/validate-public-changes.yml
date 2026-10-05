@@ -67,6 +67,12 @@ jobs:
         shell: bash
         run: bash .github/policy/test-policy.sh
 
+      # The dispatcher's environment pre-flight, run against stub API answers: only custom branch
+      # policies of exactly main and untrusted pass.
+      - name: Test the dispatcher pre-flight against stub endpoints
+        shell: bash
+        run: bash .github/policy/test-preflight.sh
+
       # The vulnerable-package gate: clean, listed, expired, malformed and incomplete-scan fixtures.
       - name: Test the vulnerability gate against fixtures
         shell: bash
