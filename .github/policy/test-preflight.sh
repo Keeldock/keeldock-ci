@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Behavioural fixtures for the dispatcher's environment pre-flight. The reviewed step is
-# extracted from validation.yml and run against a stub `curl` that answers the environment
-# read. It must ask exactly for this repository's source-read environment, pass only when the
-# environment exists and allows protected branches only, and refuse a 404 (with the setup
-# message), any other status, a failed request, any other branch policy, a malformed SHA and an
-# unknown gate. Run from the repository root.
+# extracted from validation.yml and run against a stub `curl` that answers the environment read
+# and the deployment-branch-policy read. It must ask exactly for this repository's source-read
+# environment and its branch policies, and pass only when the environment uses custom branch
+# policies that are exactly the branches main and untrusted. "Protected branches only" is
+# refused: for environments GitHub counts only classic branch protection rules as protected, not
+# rulesets, so with rulesets it lets every branch deploy. A 404 (with the setup message), any
+# other status, a failed request, a wildcard, a tag policy, a third branch, a missing branch, a
+# malformed SHA and an unknown gate are refused. Run from the repository root.
 set -euo pipefail
 
 workflow=.github/workflows/validation.yml
@@ -35,19 +38,30 @@ while (( $# )); do
   shift
 done
 printf '%s\n' "${url}" >> "${FAKE_LOG}"
-[[ -n "${out}" ]] && printf '%s' "${FAKE_BODY}" > "${out}"
-printf '%s' "${FAKE_CODE}"
-exit "${FAKE_RC:-0}"
+case "${url}" in
+  */deployment-branch-policies*) code="${FAKE_POLICIES_CODE}" body="${FAKE_POLICIES}" rc="${FAKE_POLICIES_RC:-0}" ;;
+  *) code="${FAKE_CODE}" body="${FAKE_BODY}" rc="${FAKE_RC:-0}" ;;
+esac
+[[ -n "${out}" ]] && printf '%s' "${body}" > "${out}"
+printf '%s' "${code}"
+exit "${rc}"
 STUB
 chmod +x "${dir}/bin/curl"
 
-policy_body() { printf '{"name":"source-read","deployment_branch_policy":%s}' "$1"; }
+environment_body() { printf '{"name":"source-read","deployment_branch_policy":%s}' "$1"; }
+custom='{"protected_branches":false,"custom_branch_policies":true}'
+policies() { # type:name ...
+  local items='' entry
+  for entry in "$@"; do items+="${items:+,}{\"id\":1,\"name\":\"${entry#*:}\",\"type\":\"${entry%%:*}\"}"; done
+  printf '{"total_count":%s,"branch_policies":[%s]}' "$#" "${items}"
+}
 preflight_run() {
   rm -rf "${dir}/runner"; mkdir -p "${dir}/runner"; : > "${dir}/calls"
   set +e
   env "${step_env[@]}" PATH="${dir}/bin:${PATH}" GITHUB_API_URL="${api}" GITHUB_REPOSITORY=Keeldock/keeldock-ci \
     RUNNER_TEMP="${dir}/runner" GITHUB_STEP_SUMMARY="${dir}/runner/summary" FAKE_LOG="${dir}/calls" \
-    FAKE_CODE=200 FAKE_BODY="$(policy_body '{"protected_branches":true,"custom_branch_policies":false}')" "$@" \
+    FAKE_CODE=200 FAKE_BODY="$(environment_body "${custom}")" \
+    FAKE_POLICIES_CODE=200 FAKE_POLICIES="$(policies branch:main branch:untrusted)" "$@" \
     bash --noprofile --norc -eo pipefail "${dir}/step.sh" > "${dir}/stdout" 2>&1
   rc=$?
   set -e
@@ -60,27 +74,54 @@ expect_refused() {
 environment_url="${api}/repos/Keeldock/keeldock-ci/environments/source-read"
 
 preflight_run
-expect_pass 'present, protected branches only'
-[[ "$(cat "${dir}/calls")" == "${environment_url}" ]] || fail "the pre-flight read $(cat "${dir}/calls"), not exactly ${environment_url}"
+expect_pass 'custom branch policies, exactly main and untrusted'
+[[ "$(cat "${dir}/calls")" == "${environment_url}
+${environment_url}/deployment-branch-policies?per_page=100" ]] || fail "the pre-flight read
+$(cat "${dir}/calls")
+not exactly the environment and its branch policies"
+preflight_run FAKE_POLICIES="$(policies branch:untrusted branch:main)"
+expect_pass 'the two branches in either order'
 
 preflight_run FAKE_CODE=404 FAKE_BODY='{"message":"Not Found"}'
 expect_refused 'a missing environment (404)' 'does not exist yet'
 for code in 401 403 500 502; do
   preflight_run FAKE_CODE="${code}" FAKE_BODY='{}'
-  expect_refused "HTTP ${code}" "could not be read (HTTP ${code})"
+  expect_refused "environment HTTP ${code}" "could not be read (HTTP ${code})"
 done
 preflight_run FAKE_CODE=000 FAKE_RC=7 FAKE_BODY=''
-expect_refused 'a failed request' 'could not be read (HTTP 000)'
-for branch_policy in null '{"protected_branches":false,"custom_branch_policies":true}' \
-  '{"protected_branches":true,"custom_branch_policies":true}' '{"protected_branches":false,"custom_branch_policies":false}' '{}'; do
-  preflight_run FAKE_BODY="$(policy_body "${branch_policy}")"
-  expect_refused "branch policy ${branch_policy}" 'protected branches only'
+expect_refused 'a failed environment request' 'could not be read (HTTP 000)'
+# "Protected branches only" is now refused: rulesets do not count as protected branches.
+preflight_run FAKE_BODY="$(environment_body '{"protected_branches":true,"custom_branch_policies":false}')"
+expect_refused 'protected branches only' 'rulesets do not count as protected branches'
+for branch_policy in null '{"protected_branches":true,"custom_branch_policies":true}' \
+  '{"protected_branches":false,"custom_branch_policies":false}' '{}'; do
+  preflight_run FAKE_BODY="$(environment_body "${branch_policy}")"
+  expect_refused "branch policy ${branch_policy}" 'exactly main and untrusted'
 done
 preflight_run FAKE_BODY='not json'
-expect_refused 'an unreadable body'
+expect_refused 'an unreadable environment'
+
+for code in 403 404 500; do
+  preflight_run FAKE_POLICIES_CODE="${code}" FAKE_POLICIES='{}'
+  expect_refused "branch policies HTTP ${code}" "branch policies could not be read (HTTP ${code})"
+done
+preflight_run FAKE_POLICIES_CODE=000 FAKE_POLICIES_RC=7 FAKE_POLICIES=''
+expect_refused 'a failed branch-policy request' 'branch policies could not be read (HTTP 000)'
+for set in 'branch:main' 'branch:untrusted' 'branch:*' 'branch:main branch:*' 'branch:main branch:untrusted branch:feature' \
+  'branch:main branch:untrusted tag:v*' 'branch:main tag:untrusted' 'branch:main branch:untrusted/*' 'branch:main branch:main'; do
+  # shellcheck disable=SC2086
+  preflight_run FAKE_POLICIES="$(policies ${set})"
+  expect_refused "branch policies ${set}" 'exactly the branches main and untrusted'
+done
+preflight_run FAKE_POLICIES='{"total_count":3,"branch_policies":[{"name":"main","type":"branch"},{"name":"untrusted","type":"branch"}]}'
+expect_refused 'a truncated policy list' 'exactly the branches main and untrusted'
+preflight_run FAKE_POLICIES='{"total_count":2,"branch_policies":[{"name":"main"},{"name":"untrusted"}]}'
+expect_refused 'policies without a type' 'exactly the branches main and untrusted'
+preflight_run FAKE_POLICIES='not json'
+expect_refused 'unreadable branch policies' 'exactly the branches main and untrusted'
 
 preflight_run REQUESTED_SOURCE_SHA=0123456
 expect_refused 'an abbreviated SHA' 'full 40-character'
 preflight_run REQUESTED_VULN_GATE=low
 expect_refused 'an unknown gate' 'vulnerability_gate must be'
-echo 'pre-flight fixtures: only a present, protected-branches-only source-read environment passes; 404, other statuses, failed requests and other policies are refused'
+echo 'pre-flight fixtures: only custom branch policies of exactly main and untrusted pass; protected-branches-only, wildcards, tags, other branches, 404s, other statuses and failed requests are refused'

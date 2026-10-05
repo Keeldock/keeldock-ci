@@ -130,7 +130,8 @@ mutation '9. exit 0 at the start of the environment pre-flight' "${dispatcher}" 
 mutation '9. a missing environment accepted' "${dispatcher}" "Refusing before any job enters it.' >&2
             exit 1" "Refusing before any job enters it.' >&2
             exit 0"
-mutation '9. any branch policy accepted' "${dispatcher}" "!= \$'true\\tfalse' ]]; then" "== never ]]; then"
+mutation '9. protected branches only accepted' "${dispatcher}" "!= \$'false\\ttrue' ]]; then" "== never ]]; then"
+mutation '9. any branch-policy list accepted' "${dispatcher}" "!= 'branch:main,branch:untrusted' ]]; then" "== never ]]; then"
 mutation 'vulnerability exception review-by cap lifted' .github/actions/supply-chain/action.yml 'VG_MAX_REVIEW_DAYS=90' 'VG_MAX_REVIEW_DAYS=3650000'
 mutation 'vulnerability exception calendar check loosened' .github/actions/supply-chain/action.yml '(( y >= 1970 && d >= 1 && d <= last )) || return 1' '(( y >= 1970 && d >= 1 && d <= 31 )) || return 1'
 

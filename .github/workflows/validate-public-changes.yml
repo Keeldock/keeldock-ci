@@ -75,12 +75,14 @@ jobs:
         shell: bash
         run: bash .github/policy/test-policy.sh
 
-      # Behavioural fixtures: the reviewed verify-and-revoke and environment pre-flight scripts,
-      # run against stub curl and git, revoke on every path and refuse what they must.
+      # Behavioural fixtures: the reviewed verify-and-revoke step, run against stub curl and git,
+      # revokes on every path and refuses what it must.
       - name: Test the source-token revoke against stub endpoints
         shell: bash
         run: bash .github/policy/test-revoke.sh
 
+      # The dispatcher's environment pre-flight, run against stub API answers: only custom branch
+      # policies of exactly main and untrusted pass.
       - name: Test the dispatcher pre-flight against stub endpoints
         shell: bash
         run: bash .github/policy/test-preflight.sh

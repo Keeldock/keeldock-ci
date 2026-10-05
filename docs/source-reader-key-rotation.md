@@ -70,8 +70,11 @@ while you wait: cancelling can interrupt the step that revokes the token.
 
 ## Optional hardening (owner decisions)
 
-- **Keep deployment branches at "Protected branches only".** `untrusted` must stay able to enter
-  `source-read` so feature-branch SHAs can be validated without touching main's caches.
+- **Keep deployment branches at exactly `main` and `untrusted`** ("Selected branches and tags",
+  two branch rules). Not "Protected branches only": rulesets do not count as protected branches
+  for environments, so that setting admits every branch, and the dispatcher's pre-flight refuses
+  it. `untrusted` must stay able to enter `source-read` so feature-branch SHAs can be validated
+  without touching main's caches.
 - **Required reviewers on `source-read`.** Every run would wait for an approval before any job
   enters the environment. It guards against a workflow merged by mistake reading the key, at the
   cost of a manual step per dispatch. Turn on "prevent self-review" only once a second trusted

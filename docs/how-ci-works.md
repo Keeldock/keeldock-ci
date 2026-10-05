@@ -47,9 +47,15 @@ repository, and the only job that enters an environment (`source-read`, which ho
 
 0. **Environment pre-flight (dispatcher).** With no environment and no secret, the
    `validate-input` job checks the SHA shape and reads this repository's `source-read`
-   environment through the API. If it does not exist, or its deployment branches are not
-   "protected branches only", the run stops there. This matters because a job that names a
-   missing environment makes GitHub create it, unprotected.
+   environment and its deployment branch policies through the API. Unless it exists, uses
+   custom branch policies ("Selected branches and tags") and those are exactly the two branches
+   `main` and `untrusted` (no wildcard, no tag, no third branch), the run stops there. This
+   matters because a job that names a missing environment makes GitHub create it, unprotected.
+   "Protected branches only" is refused: for environments GitHub counts only classic branch
+   protection rules as protected, not rulesets, and this repository protects its branches with
+   rulesets, so that setting lets every branch deploy (a probe proved an unprotected scratch
+   branch could enter `source-read`). `test-preflight.sh` runs the reviewed step against stub
+   API answers for each case.
 1. **Guard.** The repository must be this one, the ref must be `refs/heads/main` or
    `refs/heads/untrusted`, the SHA must match `^[0-9a-fA-F]{40}$`, and the App id and key must
    be present (the key's value never enters this step, only whether it is empty). A run from
@@ -79,8 +85,8 @@ SHA, failed revoke) it must call exactly the reviewed endpoints (`/repositories/
 `/repos/Moh-Bakr/keeldock-cloud/commits/<sha>`, `.../compare/main...<sha>` and
 `DELETE /installation/token` with the source token), write only the literal ancestry answer, and
 fail unless every check passed; on `main` an unreachable SHA must be refused. `test-preflight.sh`
-does the same for step 0: only a present, protected-branches-only `source-read` passes; a 404,
-any other status, a failed request and any other branch policy are refused. `test-mutations.sh`
+does the same for step 0: only custom branch policies of exactly `main` and `untrusted` pass;
+protected-branches-only, a 404, any other status, a failed request and any other policy are refused. `test-mutations.sh`
 applies each weakening an independent review found (an early `exit 0`, a re-pointed endpoint, a
 dropped `needs:`, an extra mint permission, `toJSON(secrets)`, an unconditional `keep-docker`, a
 weaker gate default and more) to a copy of the tree and requires the policy to reject every one.
@@ -171,7 +177,9 @@ unprotected `source-read`, and the concern refuses a missing App id or key befor
    and generate a private key. If keeldock-cloud is later transferred to the Keeldock
    organisation, an organisation-owned App becomes possible and `SOURCE_REPOSITORY_OWNER` changes.
 2. **Environment.** Settings → Environments → New environment `source-read`; Deployment branches
-   and tags: **Protected branches only**. Add the environment secret `SOURCE_READER_PRIVATE_KEY`
+   and tags: **Selected branches and tags**, with exactly two branch rules, `main` and
+   `untrusted` (not "Protected branches only": rulesets do not count as protected branches for
+   environments, so that setting admits every branch here). Add the environment secret `SOURCE_READER_PRIVATE_KEY`
    (the whole PEM) and the environment variable `SOURCE_READER_APP_ID` (the numeric App ID). Do
    not create repository-level copies.
 3. **Rulesets** (Settings → Rules → Rulesets):
@@ -180,7 +188,8 @@ unprotected `source-read`, and the concern refuses a missing App id or key befor
      Actions). Bypass list: Repository admin role, mode "For pull requests only".
    - `untrusted` (target `refs/heads/untrusted`): restrict deletions, restrict updates, block
      force pushes. Bypass list: Repository admin role, mode "Always".
-   Both branches then count as protected, so `source-read` deploys to both and to nothing else.
+   The rulesets guard who may update the two branches; the environment's selected-branch rules
+   are what limit `source-read` to them.
 4. **Actions → General:** fork pull request approval "Require approval for all external
    contributors" (already the organisation setting); workflow permissions "Read repository
    contents" (already set). Recommended, as on Taurine-CI: Actions permissions "Allow Keeldock,
@@ -190,7 +199,8 @@ unprotected `source-read`, and the concern refuses a missing App id or key befor
 Check them:
 
 ```bash
-gh api repos/Keeldock/keeldock-ci/environments/source-read -q .deployment_branch_policy   # protected_branches: true
+gh api repos/Keeldock/keeldock-ci/environments/source-read -q .deployment_branch_policy   # protected_branches: false, custom_branch_policies: true
+gh api repos/Keeldock/keeldock-ci/environments/source-read/deployment-branch-policies -q '.branch_policies[] | "\(.type) \(.name)"'   # branch main, branch untrusted
 gh api repos/Keeldock/keeldock-ci/environments/source-read/variables -q '.variables[].name'  # SOURCE_READER_APP_ID
 gh api repos/Keeldock/keeldock-ci/environments/source-read/secrets -q '.secrets[].name'      # SOURCE_READER_PRIVATE_KEY
 gh api repos/Keeldock/keeldock-ci/rules/branches/main -q '.[].type'
@@ -278,7 +288,7 @@ These are known, reviewed and accepted; each is limited by the controls named.
 - Own repository, own Actions concurrency, own App and key, own `source-read` environment.
 - Protected ancestry is "reachable from keeldock-cloud `main`" (Taurine checks `develop`, `uat`
   and `main`).
-- The dispatcher checks that `source-read` exists and is limited to protected branches before any
+- The dispatcher checks that `source-read` exists and is limited to exactly `main` and `untrusted` before any
   job can enter it, and the concern refuses a missing App id or key before the mint.
 - No `source-checkout`, `sanitize`, `concern-report`, `run-result` or `root-setup` composite: the
   Keel Dock lane never used them (its checkout is inline and pinned by `check-concern.sh`).

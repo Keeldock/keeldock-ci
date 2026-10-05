@@ -59,8 +59,9 @@ check_dispatcher() {
     exit 1
   fi
   # Before any job enters source-read, the dispatcher proves the environment exists and is
-  # limited to protected branches, so a first run can never create it unprotected.
-  if ! grep -qF '/environments/source-read' "$workflow" || ! grep -qF 'deployment_branch_policy.protected_branches' "$workflow"; then
+  # limited to exactly main and untrusted, so a first run can never create it unprotected (its
+  # behaviour is proved by test-preflight.sh).
+  if ! grep -qF '/environments/source-read' "$workflow" || ! grep -qF '/environments/source-read/deployment-branch-policies' "$workflow"; then
     echo "The protected dispatcher must verify the source-read environment before calling the concern: $workflow" >&2
     exit 1
   fi
