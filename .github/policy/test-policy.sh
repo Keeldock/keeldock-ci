@@ -30,6 +30,10 @@ YAML
 name: protected
 on:
   workflow_call:
+    inputs:
+      vulnerability_gate:
+        type: string
+        default: high
 permissions: {}
 jobs:
   validate:
@@ -37,6 +41,44 @@ jobs:
     environment: \${{ inputs.environment }}
     steps:
       - uses: actions/checkout@${sha}
+      - name: Mint read-only private-source token
+        uses: actions/create-github-app-token@${sha}
+        with:
+          client-id: \${{ vars.SOURCE_READER_APP_ID }}
+          private-key: \${{ secrets.SOURCE_READER_PRIVATE_KEY }}
+          owner: \${{ env.SOURCE_REPOSITORY_OWNER }}
+          repositories: \${{ env.SOURCE_REPOSITORY_NAME }}
+          permission-contents: read
+          skip-token-revoke: true
+      - uses: ./.github/actions/drop-root
+        with:
+          keep-docker: \${{ inputs.concern == 'db-containers' || inputs.concern == 'apphost-cold-start' }}
+      - uses: ./.github/actions/supply-chain
+        with:
+          vulnerability-gate: \${{ inputs.vulnerability_gate }}
+YAML
+  cat > "${root}/.github/workflows/validation.yml" <<YAML
+name: dispatcher
+on:
+  workflow_dispatch:
+    inputs:
+      vulnerability_gate:
+        type: choice
+        default: high
+        options: [none, high, critical]
+permissions: {}
+jobs:
+  validate-input:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo checked
+  validate:
+    needs: validate-input
+    uses: ./.github/workflows/validation-concern.yml
+    secrets:
+      SOURCE_READER_PRIVATE_KEY: \${{ secrets.SOURCE_READER_PRIVATE_KEY }}
+    with:
+      vulnerability_gate: \${{ inputs.vulnerability_gate }}
 YAML
   cat > "${root}/.github/actions/demo/action.yml" <<YAML
 name: demo
@@ -106,6 +148,105 @@ expect_fail 'another job entering source-read' "${root}" 'enters an environment'
 
 root="$(fresh renamed-job)"; mutate "${root}" .github/workflows/validation-concern.yml 's/^  validate:/  other:/m'
 expect_fail 'the protected job renamed' "${root}" 'enters an environment'
+
+# Literal edits for the rules below (no regex escaping): swap replaces the first occurrence of
+# OLD with NEW, add_after inserts TEXT after the first occurrence of ANCHOR; both fail loudly
+# when the text is not found, so a fixture can never silently test nothing.
+swap() { OLD="$3" NEW="$4" ruby -e 's = File.read(ARGV[0]); i = s.index(ENV["OLD"]) or abort("fixture text not found: #{ENV["OLD"]}"); s[i, ENV["OLD"].length] = ENV["NEW"]; File.write(ARGV[0], s)' "$1/$2"; }
+add_after() { swap "$1" "$2" "$3" "$3$4"; }
+checkout_line="      - uses: actions/checkout@${sha}
+"
+
+# Whole-context reads (rule 6).
+for leak in '${{ toJSON(secrets) }}' '${{ toJSON(vars) }}' '${{ toJSON(github) }}' "\${{ format('{0}', secrets) }}" '${{ secrets[matrix.name] }}' '${{ secrets.* }}' '${{ join(vars) }}'; do
+  root="$(fresh whole-context)"; add_after "${root}" .github/workflows/ordinary.yml "${checkout_line}" "        env:
+          LEAK: ${leak}
+"
+  expect_fail "a whole-context read (${leak})" "${root}" 'reads a whole secrets, vars or github context'
+done
+root="$(fresh bare-if)"; add_after "${root}" .github/workflows/ordinary.yml '  build:
+' "    if: toJSON(vars) != '{}'
+"
+expect_fail 'a whole-context read in a bare if' "${root}" 'reads a whole secrets, vars or github context'
+root="$(fresh whole-context-composite)"; add_after "${root}" .github/actions/demo/action.yml "    - uses: actions/checkout@${sha}
+" '      with:
+        token: ${{ toJSON(secrets) }}
+'
+expect_fail 'a whole-context read in a composite' "${root}" 'actions/demo/action.yml: an expression reads a whole'
+root="$(fresh named-member)"; add_after "${root}" .github/workflows/ordinary.yml "${checkout_line}" "        env:
+          OK: \${{ vars.SOURCE_READER_APP_ID }} \${{ matrix.vars }} \${{ format('secrets') }}
+"
+expect_pass 'named members and a quoted word are not whole-context reads' "${root}"
+
+# The token mint is an exact allow-list (rule 7).
+mint_case() {
+  local label="$1" old="$2" new="$3"
+  root="$(fresh mint)"; swap "${root}" .github/workflows/validation-concern.yml "${old}" "${new}"
+  expect_fail "a token mint outside the allow-list (${label})" "${root}" 'is not a reviewed `with:` map'
+}
+mint_case 'an extra permission' '          permission-contents: read
+' '          permission-contents: read
+          permission-actions: write
+'
+mint_case 'contents write' 'permission-contents: read' 'permission-contents: write'
+mint_case 'another owner' 'owner: ${{ env.SOURCE_REPOSITORY_OWNER }}' 'owner: Moh-Bakr'
+mint_case 'another repository' 'repositories: ${{ env.SOURCE_REPOSITORY_NAME }}' 'repositories: keeldock-cloud,other'
+mint_case 'no skip-token-revoke' '          skip-token-revoke: true
+' ''
+mint_case 'an unreviewed key' '          permission-contents: read
+' '          permission-contents: read
+          github-api-url: https://example.invalid
+'
+root="$(fresh app-id)"; swap "${root}" .github/workflows/validation-concern.yml 'client-id:' 'app-id:'
+expect_pass 'app-id is the reviewed alias of client-id' "${root}"
+root="$(fresh mint-elsewhere)"; add_after "${root}" .github/workflows/ordinary.yml "${checkout_line}" "      - uses: actions/create-github-app-token@${sha}
+"
+expect_fail 'a mint in an unreviewed file' "${root}" 'ordinary.yml: token mint'
+root="$(fresh no-mint)"; swap "${root}" .github/workflows/validation-concern.yml "uses: actions/create-github-app-token@${sha}" "uses: actions/checkout@${sha}"
+expect_fail 'the reviewed mint removed' "${root}" 'the reviewed token mint is missing'
+
+# keep-docker is absent or the reviewed expression (rule 8).
+reviewed_keep="\${{ inputs.concern == 'db-containers' || inputs.concern == 'apphost-cold-start' }}"
+for keep in "'true'" 'true' '${{ true }}' "\${{ inputs.concern != 'unit' }}" "${reviewed_keep} || true"; do
+  root="$(fresh keep-docker)"; swap "${root}" .github/workflows/validation-concern.yml "keep-docker: ${reviewed_keep}" "keep-docker: ${keep}"
+  expect_fail "keep-docker ${keep}" "${root}" 'keep-docker must be absent or the reviewed expression'
+done
+root="$(fresh keep-docker-absent)"; swap "${root}" .github/workflows/validation-concern.yml "        with:
+          keep-docker: ${reviewed_keep}
+" ''
+expect_pass 'keep-docker absent' "${root}"
+
+# The dispatcher's pre-flight gates the concern (rule 9).
+root="$(fresh no-needs)"; swap "${root}" .github/workflows/validation.yml '    needs: validate-input
+' ''
+expect_fail 'the concern no longer needs the pre-flight' "${root}" 'must need the pre-flight job validate-input directly'
+root="$(fresh needs-other)"; swap "${root}" .github/workflows/validation.yml 'needs: validate-input' 'needs: [other]'
+expect_fail 'the concern needs another job' "${root}" 'must need the pre-flight job'
+for past in '${{ always() }}' 'always()' '${{ !cancelled() }}' 'failure() || success()'; do
+  root="$(fresh needs-always)"; add_after "${root}" .github/workflows/validation.yml '    needs: validate-input
+' "    if: ${past}
+"
+  expect_fail "the concern runs past a failed pre-flight (${past})" "${root}" 'may not run past a failed pre-flight'
+done
+root="$(fresh preflight-continue)"; add_after "${root}" .github/workflows/validation.yml '  validate-input:
+' '    continue-on-error: true
+'
+expect_fail 'the pre-flight continues on error' "${root}" 'must not continue on error'
+root="$(fresh preflight-gone)"; swap "${root}" .github/workflows/validation.yml '  validate-input:' '  checks:'
+expect_fail 'the pre-flight job renamed away' "${root}" 'the reviewed pre-flight job validate-input is missing'
+
+# The vulnerability gate defaults to high and is passed through (rule 10).
+for file in validation.yml validation-concern.yml; do
+  for gate in none critical "''"; do
+    root="$(fresh gate-default)"; swap "${root}" ".github/workflows/${file}" 'default: high' "default: ${gate}"
+    expect_fail "${file} vulnerability_gate default ${gate}" "${root}" 'input vulnerability_gate must default to "high"'
+  done
+done
+root="$(fresh gate-pass)"; swap "${root}" .github/workflows/validation.yml 'vulnerability_gate: ${{ inputs.vulnerability_gate }}' 'vulnerability_gate: none'
+expect_fail 'the dispatcher hard-codes the gate' "${root}" 'must pass vulnerability_gate'
+root="$(fresh gate-pass-composite)"; swap "${root}" .github/workflows/validation-concern.yml 'vulnerability-gate: ${{ inputs.vulnerability_gate }}' 'vulnerability-gate: none'
+expect_fail 'the concern hard-codes the gate' "${root}" 'must pass vulnerability-gate'
+echo 'hardening fixtures: whole-context reads, unreviewed mints, keep-docker, an ungated concern and a weaker gate default are rejected'
 
 # Size limits.
 size_root="${base}/sizes"
@@ -202,9 +343,19 @@ fresh_dir="${base}/freshness"
 mkdir -p "${fresh_dir}/bin"
 cat > "${fresh_dir}/bin/curl" <<'STUB'
 #!/usr/bin/env bash
-case "${FAKE_COMPARE_STATUS}" in
-  unreadable) exit 22 ;;
-  *) printf '{"status":"%s","ahead_by":%s,"behind_by":%s}\n' "${FAKE_COMPARE_STATUS}" "${FAKE_AHEAD_BY:-0}" "${FAKE_BEHIND_BY:-0}" ;;
+url="${*: -1}"
+case "${url}" in
+  */compare/main...*)
+    case "${FAKE_COMPARE_STATUS}" in
+      unreadable) exit 22 ;;
+      *) printf '{"status":"%s","ahead_by":%s,"behind_by":%s}\n' "${FAKE_COMPARE_STATUS}" "${FAKE_AHEAD_BY:-0}" "${FAKE_BEHIND_BY:-0}" ;;
+    esac ;;
+  */compare/"${GITHUB_SHA}"...main)
+    files="${FAKE_FILES:-}"
+    [[ -n "${files}" ]] || files='[{"filename":"docs/how-ci-works.md"}]'
+    [[ "${files}" == unreadable ]] && exit 22
+    printf '{"status":"ahead","files":%s}\n' "${files}" ;;
+  *) exit 22 ;;
 esac
 STUB
 chmod +x "${fresh_dir}/bin/curl"
@@ -225,7 +376,7 @@ for guard_file in .github/workflows/validation-concern.yml; do
       GITHUB_STEP_SUMMARY="${fresh_dir}/summary" CONTROL_PLANE_TOKEN=unused \
       REQUESTED_SOURCE_SHA=2222222222222222222222222222222222222222 REQUESTED_PLATFORM=linux \
       REQUESTED_CONCERN=unit REQUESTED_VULN_GATE=none \
-      FAKE_COMPARE_STATUS="${status}" FAKE_AHEAD_BY="${ahead}" FAKE_BEHIND_BY="${behind}" \
+      FAKE_COMPARE_STATUS="${status}" FAKE_AHEAD_BY="${ahead}" FAKE_BEHIND_BY="${behind}" FAKE_FILES="${FAKE_FILES:-}" \
       bash "${fresh_dir}/guard.sh" >"${fresh_dir}/out" 2>&1
     freshness_rc=$?
     set -e

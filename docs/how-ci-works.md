@@ -72,7 +72,24 @@ repository, and the only job that enters an environment (`source-read`, which ho
 
 The policy parses the job and fails if anything but the reviewed pre-source steps precedes the
 revoke, if the revoke is not under `always()`, or if the identity constants, the mint scope, the
-ancestry rule or the settings guard change (`check-concern.sh`, `revocation-order.rb`).
+ancestry rule or the settings guard change (`check-concern.sh`, `revocation-order.rb`). The mint's
+`with:` is an exact allow-list of keys and values (`client-id` or `app-id`, `private-key`,
+`owner`, `repositories`, `permission-contents: read`, `skip-token-revoke: true`), the concern
+needs the pre-flight job directly and never runs past its failure, and no expression may read a
+whole `secrets`, `vars` or `github` context (`check-universal.rb`).
+
+Strings prove little about a script, so the two scripts that guard the token are also run as
+behaviour. `test-revoke.sh` extracts step 4 and runs it against stub `curl` and `git` that record
+every call: on every path (success, failed checkout, identity mismatch, SHA mismatch, unreachable
+SHA, failed revoke) it must call exactly the reviewed endpoints (`/repositories/1377321992`,
+`/repos/Moh-Bakr/keeldock-cloud/commits/<sha>`, `.../compare/main...<sha>` and
+`DELETE /installation/token` with the source token), write only the literal ancestry answer, and
+fail unless every check passed; on `main` an unreachable SHA must be refused. `test-preflight.sh`
+does the same for step 0: only custom branch policies of exactly `main` and `untrusted` pass;
+protected-branches-only, a 404, any other status, a failed request and any other policy are refused. `test-mutations.sh`
+applies each weakening an independent review found (an early `exit 0`, a re-pointed endpoint, a
+dropped `needs:`, an extra mint permission, `toJSON(secrets)`, an unconditional `keep-docker`, a
+weaker gate default and more) to a copy of the tree and requires the policy to reject every one.
 
 ## Root before project code
 
@@ -208,7 +225,9 @@ With `high` or `critical` the scan fails closed (a non-zero exit, an NU190x feed
 recognisable result, or unparseable output is a FAIL); `none` only warns. A reviewed exception
 lives in the private repository at `.github/nuget-vulnerability-exceptions.txt`, one
 `<GHSA-or-CVE-id>  <review-by YYYY-MM-DD>  # reason` per line, honoured through its review-by date;
-a malformed line fails the gate. Only advisory ids, severities, counts and an 8-hex package-name
+a malformed line fails the gate. The review-by date must be a real calendar date (2026-02-31 is
+malformed) no more than 90 days after the run's date, so an exception is re-reviewed at least
+every 90 days and a far-future date (9999-12-31) fails the gate rather than disabling it. Only advisory ids, severities, counts and an 8-hex package-name
 hash are published. `test-vuln-gate.sh` runs the library over fixtures in the policy workflow.
 
 ## Sanitising: no artifacts, no source in logs
@@ -220,6 +239,49 @@ hash are published. `test-vuln-gate.sh` runs the library over fixtures in the po
 - Workflows declare `permissions: {}` and grant per job; every Action is SHA-pinned and on the
   allow-list in `check-actions.sh`; protected workflows set `cancel-in-progress: false`, so a cancel
   cannot skip the revoke. Never cancel a source-bearing run.
+
+## Changing the policy
+
+A pull request carries its own `.github/policy/`, so on its own the policy run would let a
+change weaken a check and rely on the weakening in one step. On `pull_request`,
+`validate-public-changes.yml` therefore runs twice in the same required job: first the pull
+request's own policy (so new fixtures run), then the base commit's: it checks out
+`github.event.pull_request.base.sha`, puts that commit's `.github/policy/` in place of the pull
+request's and runs every base check script against the pull request's tree. A change must pass
+both. `test-mutations.sh` proves the second pass catches a pull request that removes a rule and
+breaks it in the same change.
+
+So a legitimate policy change that the old policy would reject (a new reviewed mint, another
+`keep-docker` expression, a renamed step a fixture extracts) lands in two pull requests: first
+make the rule permissive or add the new rule beside the old one, merge, then land the change
+that relies on it. The pull request's own copy of `validate-public-changes.yml` is what runs, so
+a pull request that edits that file to drop the base pass is caught only by review: treat any
+change to `validate-public-changes.yml` or `.github/policy/` as a policy change and review it
+as one.
+
+## Accepted residual risks
+
+These are known, reviewed and accepted; each is limited by the controls named.
+
+- **(a) The App key is readable by project code on Windows and in Docker-kept concerns.** The
+  key is a job secret held in runner memory for the whole job. Windows cannot drop administrator
+  rights, and `db-containers` and `apphost-cold-start` keep Docker (root-equivalent), so project
+  code there can read it. The key is rotated every 90 days
+  (`docs/source-reader-key-rotation.md`), and the App is installed on one repository with
+  contents read-only, so a stolen key reads keeldock-cloud and nothing else.
+- **(b) An approved fork pull request can read main's NuGet cache.** Caches written by the base
+  branch are readable by pull request runs. This repository's own policy run restores no cache,
+  but a fork pull request a maintainer approves runs code that can ask the cache service for
+  main's entries. Fork approval ("Require approval for all external contributors") therefore
+  stays mandatory, and restored archives are re-hashed against the lock files before use.
+- **(c) Hashed package names are a weak control.** Dependency and SBOM names are published as
+  8-hex SHA-256 prefixes, but the set of NuGet package names is public, so a dictionary attack
+  reverses them. The hash keeps names out of casual reading, not out of a determined reader.
+- **(d) After the revoke, project code can tamper with later reporting steps.** Project code runs
+  as the job user in the same job as the summary, proof and egress steps, so it can change what
+  they report. The trust model is that keeldock-cloud writers and their dependencies are trusted
+  for confidentiality: the controls stop them reaching the token, root and main's caches, not
+  falsifying their own run's report. The source of truth for a result is the job conclusion.
 
 ## Differences from the Taurine-CI lane
 

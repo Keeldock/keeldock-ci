@@ -54,6 +54,20 @@ for bad in 'GHSA-aaaa-bbbb-cccc  2026-12-01' 'GHSA-aaaa-bbbb-cccc  2026-12-01  #
   run high "${dir}/clean.log" 0 "${dir}/bad.txt" "${today}"; expect FAIL 'malformed' "malformed entry: ${bad}"
   run high "${dir}/high.log" 0 "${dir}/bad.txt" "${today}"; expect FAIL 'malformed' "malformed entry with a finding: ${bad}"
 done
+# A review-by date must be a real calendar date, at most 90 days after today.
+for bad in 'GHSA-aaaa-bbbb-cccc  2026-02-31  # no such day' 'GHSA-aaaa-bbbb-cccc  2026-11-31  # thirty days' 'GHSA-aaaa-bbbb-cccc  2027-02-29  # not a leap year' 'GHSA-aaaa-bbbb-cccc  2026-12-00  # day zero'; do
+  printf '%s\n' "${bad}" > "${dir}/bad.txt"
+  run high "${dir}/high.log" 0 "${dir}/bad.txt" "${today}"; expect FAIL 'malformed' "not a calendar date: ${bad}"
+done
+for far in 9999-12-31 2027-01-04; do
+  printf 'GHSA-aaaa-bbbb-cccc  %s  # too far ahead\n' "${far}" > "${dir}/far.txt"
+  run high "${dir}/high.log" 0 "${dir}/far.txt" "${today}"; expect FAIL 'more than 90 days ahead (line 1)' "review-by ${far} beyond the 90-day cap"
+  run high "${dir}/clean.log" 0 "${dir}/far.txt" "${today}"; expect FAIL 'more than 90 days ahead' "review-by ${far} beyond the cap with a clean scan"
+done
+printf 'GHSA-aaaa-bbbb-cccc  2027-01-03  # exactly 90 days\n' > "${dir}/cap.txt"
+run high "${dir}/high.log" 0 "${dir}/cap.txt" "${today}"; expect warn '1 excepted' 'a review-by exactly 90 days ahead'
+printf 'GHSA-aaaa-bbbb-cccc  2028-02-29  # leap day\n' > "${dir}/leap.txt"
+run high "${dir}/high.log" 0 "${dir}/leap.txt" 2028-01-01; expect warn '1 excepted' 'a leap day is a real date'
 printf 'GHSA-aaaa-bbbb-cccc  2026-12-01  # fine\nnonsense\n' > "${dir}/bad.txt"
 run high "${dir}/clean.log" 0 "${dir}/bad.txt" "${today}"; expect FAIL 'line 2' 'one bad line fails the file'
 

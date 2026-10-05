@@ -14,7 +14,8 @@ name: Keel Dock source validation (protected)
 # unreachable, a non-zero exit, unparseable output) the step fails rather than warns. `critical`
 # fails on Critical only; `none` is report-only. A reviewed exception for an advisory with no fix
 # lives in the private repository at `.github/nuget-vulnerability-exceptions.txt`, one
-# `<GHSA-or-CVE-id>  <review-by YYYY-MM-DD>  # reason` per line, honoured through its review-by date.
+# `<GHSA-or-CVE-id>  <review-by YYYY-MM-DD>  # reason` per line, honoured through its review-by date
+# (a real calendar date at most 90 days ahead).
 on:
   workflow_dispatch:
     inputs:
