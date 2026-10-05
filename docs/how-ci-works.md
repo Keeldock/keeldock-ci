@@ -213,6 +213,24 @@ gh api repos/Keeldock/keeldock-ci/rules/branches/main -q '.[].type'
 gh api repos/Keeldock/keeldock-ci/rules/branches/untrusted -q '.[].type'                     # deletion, update, non_fast_forward
 ```
 
+## Runs are never deduplicated or cancelled
+
+Every source-bearing workflow gives each run its own concurrency group (it contains
+`github.run_id`) and `cancel-in-progress` is false. GitHub keeps only one *pending* run per
+group, so a shared per-SHA group let a later dispatch silently cancel an earlier queued run; that
+is why groups are per run. Nothing deduplicates runs: two dispatches for the same SHA both run.
+Lanes must therefore check for an existing run before dispatching:
+
+```bash
+gh run list -R Keeldock/keeldock-ci --workflow validation.yml --status queued
+gh run list -R Keeldock/keeldock-ci --workflow validation.yml --status in_progress
+```
+
+Caches are first-writer-wins on an exact key, so concurrent runs racing on a save are harmless.
+`.github/policy/check-concurrency.sh` enforces the rule, with fixtures in `test-policy.sh`: a group
+without `github.run_id` or a `cancel-in-progress: true` fails the policy. The dispatchers do not
+print a duplicate-run notice, because their first job holds no `actions: read` permission.
+
 ## Concerns
 
 | Concern | Runs on | Proves |

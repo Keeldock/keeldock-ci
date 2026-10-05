@@ -12,23 +12,10 @@ source "${policy}/check-concern.sh"
 source "${policy}/check-protected.sh"
 source "${policy}/check-dispatchers.sh"
 
-# Never cancel a source-bearing run: cancellation can interrupt the step that revokes the
-# short-lived source token. Every protected workflow that declares a concurrency group must say
-# cancel-in-progress: false, and every non-reusable one must declare it.
-for guarded in "${protected_source_workflows[@]}" "${protected_dispatch_workflows[@]}"; do
-  if grep -qE '^  cancel-in-progress:[[:space:]]*(true|\$\{\{)' "$guarded"; then
-    echo "A protected workflow must set cancel-in-progress: false: $guarded" >&2
-    exit 1
-  fi
-  reusable_only=0
-  for reusable_workflow in "${reusable_protected_workflows[@]}"; do
-    [[ "$guarded" == "$reusable_workflow" ]] && reusable_only=1
-  done
-  if (( ! reusable_only )) && ! grep -qE '^  cancel-in-progress:[[:space:]]*false[[:space:]]*$' "$guarded"; then
-    echo "A protected workflow must declare cancel-in-progress: false: $guarded" >&2
-    exit 1
-  fi
-done
+# Never cancel or replace a source-bearing run: cancellation can interrupt the step that revokes
+# the short-lived source token, and GitHub replaces a pending run in a shared group. Each run
+# needs its own group (github.run_id) or none, and cancel-in-progress false (check-concurrency.sh).
+bash "${policy}/check-concurrency.sh" >/dev/null || { bash "${policy}/check-concurrency.sh" >&2 || true; exit 1; }
 
 # Every workflow file is in exactly one tier: no unlisted workflow can appear.
 while IFS= read -r -d '' workflow; do
